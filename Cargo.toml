@@ -1,0 +1,8 @@
+[package]
+name = "tcp"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+etherparse = "0.17"
+tun = "0.7"
