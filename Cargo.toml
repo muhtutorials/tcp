@@ -3,6 +3,12 @@ name = "tcp"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+name = "tcp"
+
+[[bin]]
+name = "tcp"
+
 [dependencies]
 etherparse = "0.17"
 tun = "0.7"

@@ -1,14 +1,18 @@
 use etherparse::{IpNumber, Ipv4Header, Ipv4HeaderSlice, TcpHeader, TcpHeaderSlice};
 use std::cmp::min;
+use std::collections::VecDeque;
 use std::io::{Error, ErrorKind, Result, Write};
 use tun::Device;
 
 pub struct Connection {
     state: State,
-    snd: SendSequenceSpace,
-    rcv: ReceiveSequenceSpace,
+    snd: SendSequence,
+    rcv: ReceiveSequence,
     ip_resp_header: Ipv4Header,
     tcp_resp_header: TcpHeader,
+    // todo: make it pub(crate)
+    pub data_in: VecDeque<u8>,
+    pub data_out: VecDeque<u8>,
 }
 
 pub enum State {
@@ -16,14 +20,14 @@ pub enum State {
     Established,
     FinWait1,
     FinWait2,
-    Closing,
+    TimeWait,
 }
 
 impl State {
-    fn is_synchronized(&self) -> bool {
+    fn is_established(&self) -> bool {
         match self {
             State::SynReceived => false,
-            State::Established | State::FinWait1 | State::FinWait2 | State::Closing => true,
+            _ => true,
         }
     }
 }
@@ -39,10 +43,10 @@ impl State {
 /// 2 - sequence numbers of unacknowledged data
 /// 3 - sequence numbers allowed for new data transmission
 /// 4 - future sequence numbers which are not yet allowed
-struct SendSequenceSpace {
+struct SendSequence {
     /// send unacknowledged
     una: u32,
-    /// send next (acknowledgment number received -> sequence number sent)
+    /// send next sequence number sent from local -> acknowledgment number received
     nxt: u32,
     /// send window
     wnd: u16,
@@ -66,8 +70,8 @@ struct SendSequenceSpace {
 /// 1 - old sequence numbers which have been acknowledged
 /// 2 - sequence numbers allowed for new reception
 /// 3 - future sequence numbers which are not yet allowed
-struct ReceiveSequenceSpace {
-    /// receive next (sequence number received -> acknowledgment number sent)
+struct ReceiveSequence {
+    /// receive next received sequence number from remote -> acknowledgment number sent
     nxt: u32,
     /// receive window
     wnd: u16,
@@ -83,16 +87,16 @@ impl Connection {
         ip_req_header: Ipv4HeaderSlice,
         tcp_req_header: TcpHeaderSlice,
     ) -> Result<Option<Self>> {
+        // only SYN packet is allowed
         if !tcp_req_header.syn() {
-            // only SYN packet is expected
             return Ok(None);
         }
 
         let iss = 0;
-        let wnd = 10;
+        let wnd = 1024;
         let mut conn = Connection {
             state: State::SynReceived,
-            snd: SendSequenceSpace {
+            snd: SendSequence {
                 una: iss,
                 nxt: iss,
                 wnd,
@@ -101,7 +105,7 @@ impl Connection {
                 wl2: 0,
                 iss,
             },
-            rcv: ReceiveSequenceSpace {
+            rcv: ReceiveSequence {
                 nxt: tcp_req_header.sequence_number() + 1,
                 wnd: tcp_req_header.window_size(),
                 up: 0,
@@ -121,6 +125,8 @@ impl Connection {
                 iss,
                 wnd,
             ),
+            data_in: VecDeque::new(),
+            data_out: VecDeque::new(),
         };
 
         conn.tcp_resp_header.syn = true;
@@ -137,22 +143,6 @@ impl Connection {
         tcp_req_header: TcpHeaderSlice,
         data: &'a [u8],
     ) -> Result<()> {
-        // SND.UNA = oldest unacknowledged sequence number
-        //
-        // SND.NXT = next sequence number to be sent
-        //
-        // SEG.ACK = acknowledgment from the receiving TCP (next sequence
-        // number expected by the receiving TCP)
-        //
-        // SEG.SEQ = first sequence number of a segment
-        //
-        // SEG.LEN = the number of octets occupied by the data in the segment
-        // (counting SYN and FIN)
-        //
-        // SEG.SEQ+SEG.LEN-1 = last sequence number of a segment
-        let rcv_nxt = self.rcv.nxt.wrapping_sub(1);
-        let req_seq_num = tcp_req_header.sequence_number();
-        let rcv_nxt_plus_wnd = self.rcv.nxt.wrapping_add(self.rcv.wnd as u32);
         let mut data_len = data.len() as u32;
         if tcp_req_header.syn() {
             data_len += 1;
@@ -160,6 +150,12 @@ impl Connection {
         if tcp_req_header.fin() {
             data_len += 1;
         }
+
+        let rcv_nxt = self.rcv.nxt.wrapping_sub(1);
+        // received sequence number (incoming segment)
+        let seq = tcp_req_header.sequence_number();
+        let wnd_end = self.rcv.nxt.wrapping_add(self.rcv.wnd as u32);
+
         //   Segment Receive  Test
         //   Length  Window
         //   ------- -------  -------------------------------------------
@@ -173,47 +169,52 @@ impl Connection {
         //     >0      >0     RCV.NXT =< SEG.SEQ < RCV.NXT+RCV.WND
         //                 or RCV.NXT =< SEG.SEQ+SEG.LEN-1 < RCV.NXT+RCV.WND
         // zero-length segment has separate rules for acceptance
-        if data_len == 0 && !tcp_req_header.syn() && !tcp_req_header.fin() {
+        let ok = if data_len == 0 {
             if self.rcv.wnd == 0 {
-                if req_seq_num != self.rcv.nxt {
-                    return Ok(());
-                }
-            } else if !is_between_wrapped(rcv_nxt, req_seq_num, rcv_nxt_plus_wnd) {
-                return Ok(());
+                if seq != self.rcv.nxt { false } else { true }
+            } else if !is_between_wrapped(rcv_nxt, seq, wnd_end) {
+                false
+            } else {
+                true
             }
         } else {
             if self.rcv.wnd == 0 {
-                return Ok(());
+                false
             // The first part of this test checks to see if the beginning of the
             // segment falls in the window, the second part of the test checks to see
             // if the end of the segment falls in the window; if the segment passes
             // either part of the test it contains data in the window.
             // RCV.NXT =< SEG.SEQ < RCV.NXT+RCV.WND
             // RCV.NXT =< SEG.SEQ+SEG.LEN-1 < RCV.NXT+RCV.WND
-            } else if !is_between_wrapped(rcv_nxt, req_seq_num, rcv_nxt_plus_wnd)
-                && !is_between_wrapped(
-                    rcv_nxt,
-                    req_seq_num.wrapping_add(data_len - 1),
-                    rcv_nxt_plus_wnd,
-                )
+            } else if !is_between_wrapped(rcv_nxt, seq, wnd_end)
+                && !is_between_wrapped(rcv_nxt, seq.wrapping_add(data_len - 1), wnd_end)
             {
-                return Ok(());
+                false
+            } else {
+                true
             }
+        };
+
+        if !ok {
+            self.write(dev, &[])?;
+            return Ok(());
         }
 
-        self.rcv.nxt = req_seq_num.wrapping_add(data_len);
+        self.rcv.nxt = seq.wrapping_add(data_len);
 
+        // todo: why is it not in the beginning?
         if !tcp_req_header.ack() {
             return Ok(());
         }
 
-        let rcv_ack = tcp_req_header.acknowledgment_number();
+        // received acknowledgment number
+        let ack = tcp_req_header.acknowledgment_number();
 
         if let State::SynReceived = self.state {
             // SND.UNA =< SEG.ACK =< SND.NXT
-            if !is_between_wrapped(
+            if is_between_wrapped(
                 self.snd.una.wrapping_sub(1),
-                rcv_ack,
+                ack,
                 self.snd.nxt.wrapping_add(1),
             ) {
                 // Must have acked our SYN, since we detected at least one acked byte,
@@ -223,44 +224,48 @@ impl Connection {
             }
         }
 
-        match self.state {
-            State::SynReceived => unreachable!(),
-            State::Established => {
-                // A new acknowledgment (called an "acceptable ack"), is one for which
-                // the inequality below holds:
-                // SND.UNA < SEG.ACK =< SND.NXT
-                // Takes into account integer wrapping.
-                // self.snd.nxt.wrapping_add(1) makes nxt inclusive in comparison.
-                // Makes is_between_wrapped more generic.
-                if !is_between_wrapped(self.snd.una, rcv_ack, self.snd.nxt.wrapping_add(1)) {
-                    return Ok(());
-                }
-                self.snd.una = rcv_ack;
-                assert!(data.is_empty());
+        if let State::Established | State::FinWait1 | State::FinWait2 = self.state {
+            // A new acknowledgment (called an "acceptable ack"), is one for which
+            // the inequality below holds:
+            // SND.UNA < SEG.ACK =< SND.NXT
+            // Takes into account integer wrapping.
+            // self.snd.nxt.wrapping_add(1) makes nxt inclusive in comparison.
+            // Makes is_between_wrapped more generic.
+            if !is_between_wrapped(self.snd.una, ack, self.snd.nxt.wrapping_add(1)) {
+                return Ok(());
+            }
+            self.snd.una = ack;
+            assert!(data.is_empty());
 
+            if let State::Established = self.state {
                 // terminate connection
                 self.tcp_resp_header.fin = true;
                 self.write(dev, &[])?;
                 self.state = State::FinWait1;
             }
-            State::FinWait1 => {
-                if !data.is_empty() || !tcp_req_header.fin() {
-                    unimplemented!()
-                }
-                // Must have acked our FIN, since we detected at least one acked byte,
-                // and we have only sent one byte (the FIN).
+        }
+
+        if let State::FinWait1 = self.state {
+            if self.snd.una == self.snd.iss + 2 {
+                // our FIN has been ACKed
                 self.state = State::FinWait2;
             }
-            State::FinWait2 => {
-                if !data.is_empty() || !tcp_req_header.fin() {
-                    unimplemented!()
-                }
-                self.tcp_resp_header.fin = false;
-                self.write(dev, &[])?;
-                self.state = State::Closing;
-            }
-            State::Closing => {}
+            // Must have acked our FIN, since we detected at least one acked byte,
+            // and we have only sent one byte (the FIN).
+            self.state = State::FinWait2;
         }
+
+        if tcp_req_header.fin() {
+            match self.state {
+                State::FinWait2 => {
+                    // done with the connection
+                    self.write(dev, &[])?;
+                    self.state = State::TimeWait;
+                }
+                _ => unimplemented!(),
+            }
+        }
+
         Ok(())
     }
 
@@ -276,8 +281,9 @@ impl Connection {
         );
 
         self.ip_resp_header
-            .set_payload_len(size)
+            .set_payload_len(size - self.ip_resp_header.header_len())
             .map_err(|err| Error::new(ErrorKind::InvalidInput, err))?;
+
         self.tcp_resp_header.checksum = self
             .tcp_resp_header
             .calc_checksum_ipv4(&self.ip_resp_header, &[])
@@ -298,7 +304,8 @@ impl Connection {
             self.tcp_resp_header.fin = false;
         }
 
-        let data_len = buf.len() - unwritten.len();
+        let unwritten_len = unwritten.len();
+        let data_len = buf.len() - unwritten_len;
         dev.send(&buf[..data_len])?;
 
         Ok(n_payload_bytes)
@@ -351,3 +358,18 @@ fn is_between_wrapped(start: u32, between: u32, end: u32) -> bool {
     }
     true
 }
+
+// fn wrapping_less_than(lhs: u32, rhs: u32) -> bool {
+//     // From RFC1323:
+//     // TCP determines if a data segment is "old" or "new" by testing
+//     // whether its sequence number is within 2**31 bytes of the left edge
+//     // of the window, and if it is not, discarding the data as "old". To
+//     // ensure that new data is never mistakenly considered old and vice-
+//     // versa, the left edge of the sender's window has to be at most
+//     // 2**31 away from the right edge of the receiver's window.
+//     lhs.wrapping_sub(rhs) > (1 << 31)
+// }
+//
+// fn is_between_wrapped(start: u32, between: u32, end: u32) -> bool {
+//     wrapping_less_than(start, between) && wrapping_less_than(between, end)
+// }
