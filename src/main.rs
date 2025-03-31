@@ -1,25 +1,19 @@
-use std::io::Result;
+use std::io::{Read, Result};
 use std::thread;
+use tcp::Interface;
 
 fn main() -> Result<()> {
-    let mut iface = tcp::Interface::new()?;
-    let mut listener_1 = iface.bind(9000)?;
-    let mut listener_2 = iface.bind(9001)?;
+    let mut iface = Interface::new()?;
+    let mut lis = iface.bind(8000)?;
 
-    let jh1 = thread::spawn(move || {
-        while let Ok(_stream) = listener_1.accept() {
-            println!("got connection on 9000");
+    let handle = thread::spawn(move || {
+        while let Ok(mut stream) = lis.accept() {
+            println!("got connection on 8000");
+            let n = stream.read(&mut []).unwrap();
         }
     });
 
-    let jh2 = thread::spawn(move || {
-        while let Ok(_stream) = listener_2.accept() {
-            println!("got connection on 9001");
-        }
-    });
-
-    jh1.join().unwrap();
-    jh2.join().unwrap();
+    handle.join().unwrap();
 
     Ok(())
 }

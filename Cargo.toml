@@ -10,5 +10,6 @@ name = "tcp"
 name = "tcp"
 
 [dependencies]
+bitflags = "2.9.0"
 etherparse = "0.17"
 tun = "0.7"

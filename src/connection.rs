@@ -2,6 +2,7 @@ use etherparse::{IpNumber, Ipv4Header, Ipv4HeaderSlice, TcpHeader, TcpHeaderSlic
 use std::cmp::min;
 use std::collections::VecDeque;
 use std::io::{Error, ErrorKind, Result, Write};
+use bitflags::bitflags;
 use tun::Device;
 
 pub struct Connection {
@@ -21,15 +22,6 @@ pub enum State {
     FinWait1,
     FinWait2,
     TimeWait,
-}
-
-impl State {
-    fn is_established(&self) -> bool {
-        match self {
-            State::SynReceived => false,
-            _ => true,
-        }
-    }
 }
 
 ///    Send Sequence Space (RFC: 793, section: 3.2)
@@ -79,6 +71,15 @@ struct ReceiveSequence {
     up: u16,
     /// initial receive sequence number
     irs: u32,
+}
+
+bitflags! {
+    #[repr(transparent)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    pub struct AvailableIo: u8 {
+        const READ = 0b00000010;
+        const WRITE = 0b00000100;
+    }
 }
 
 impl Connection {
@@ -142,7 +143,7 @@ impl Connection {
         ip_req_header: Ipv4HeaderSlice,
         tcp_req_header: TcpHeaderSlice,
         data: &'a [u8],
-    ) -> Result<()> {
+    ) -> Result<AvailableIo> {
         let mut data_len = data.len() as u32;
         if tcp_req_header.syn() {
             data_len += 1;
@@ -197,14 +198,14 @@ impl Connection {
 
         if !ok {
             self.write(dev, &[])?;
-            return Ok(());
+            return Ok(self.available_io());
         }
 
         self.rcv.nxt = seq.wrapping_add(data_len);
 
         // todo: why is it not in the beginning?
         if !tcp_req_header.ack() {
-            return Ok(());
+            return Ok(self.available_io());
         }
 
         // received acknowledgment number
@@ -231,18 +232,19 @@ impl Connection {
             // Takes into account integer wrapping.
             // self.snd.nxt.wrapping_add(1) makes nxt inclusive in comparison.
             // Makes is_between_wrapped more generic.
-            if !is_between_wrapped(self.snd.una, ack, self.snd.nxt.wrapping_add(1)) {
-                return Ok(());
+            if is_between_wrapped(self.snd.una, ack, self.snd.nxt.wrapping_add(1)) {
+                self.snd.una = ack;
             }
-            self.snd.una = ack;
             assert!(data.is_empty());
 
-            if let State::Established = self.state {
-                // terminate connection
-                self.tcp_resp_header.fin = true;
-                self.write(dev, &[])?;
-                self.state = State::FinWait1;
-            }
+            self.data_in.extend(data);
+
+            // if let State::Established = self.state {
+            //     // terminate connection
+            //     self.tcp_resp_header.fin = true;
+            //     self.write(dev, &[])?;
+            //     self.state = State::FinWait1;
+            // }
         }
 
         if let State::FinWait1 = self.state {
@@ -266,7 +268,7 @@ impl Connection {
             }
         }
 
-        Ok(())
+        Ok(self.available_io())
     }
 
     fn write<'a>(&mut self, dev: &mut Device, payload: &'a [u8]) -> Result<usize> {
@@ -332,6 +334,30 @@ impl Connection {
         self.tcp_resp_header.acknowledgment_number = 0;
         self.write(dev, &[])?;
         Ok(())
+    }
+
+    pub(crate) fn is_received_closed(&self) -> bool {
+        if let State::TimeWait = self.state {
+            return true;
+        }
+        false
+    }
+
+    fn available_io(&self) -> AvailableIo {
+        let mut aio = AvailableIo::empty();
+        if self.is_received_closed() || !self.data_in.is_empty() {
+            aio.insert(AvailableIo::READ);
+        }
+        aio
+    }
+}
+
+impl State {
+    fn is_established(&self) -> bool {
+        match self {
+            State::SynReceived => false,
+            _ => true,
+        }
     }
 }
 
