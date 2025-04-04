@@ -19,7 +19,7 @@ impl TcpListener {
                 return Ok(TcpStream {
                     addr_pair,
                     conn_manager: self.conn_manager.clone(),
-                })
+                });
             }
             conn_manager = self.conn_manager.conn_notify.wait(conn_manager).unwrap();
         }

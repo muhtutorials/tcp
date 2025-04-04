@@ -1,8 +1,10 @@
+use bitflags::bitflags;
+use core::time;
 use etherparse::{IpNumber, Ipv4Header, Ipv4HeaderSlice, TcpHeader, TcpHeaderSlice};
 use std::cmp::min;
 use std::collections::VecDeque;
 use std::io::{Error, ErrorKind, Result, Write};
-use bitflags::bitflags;
+use std::time::{Duration, Instant};
 use tun::Device;
 
 pub struct Connection {
@@ -13,7 +15,10 @@ pub struct Connection {
     tcp_resp_header: TcpHeader,
     // todo: make it pub(crate)
     pub data_in: VecDeque<u8>,
+    // unACKed by remote data
     pub data_out: VecDeque<u8>,
+    timers: Timers,
+    closed: bool,
 }
 
 pub enum State {
@@ -73,12 +78,20 @@ struct ReceiveSequence {
     irs: u32,
 }
 
+struct Timers {
+    last_send: Instant,
+    send_times: VecDeque<(u32, Instant)>,
+    /// Smoothed Round Trip Time
+    srtt: Duration,
+}
+
+// todo: maybe try to implement it myself
 bitflags! {
     #[repr(transparent)]
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
     pub struct AvailableIo: u8 {
-        const READ = 0b00000010;
-        const WRITE = 0b00000100;
+        const READ = 0b00000001;
+        const WRITE = 0b00000010;
     }
 }
 
@@ -128,13 +141,48 @@ impl Connection {
             ),
             data_in: VecDeque::new(),
             data_out: VecDeque::new(),
+            timers: Timers {
+                last_send: Instant::now(),
+                send_times: VecDeque::new(),
+                srtt: time::Duration::from_secs(60),
+            },
+            closed: false,
         };
 
         conn.tcp_resp_header.syn = true;
         conn.tcp_resp_header.ack = true;
-        conn.write(dev, &[])?;
+        conn.write(dev, conn.snd.nxt, &[])?;
 
         Ok(Some(conn))
+    }
+
+    pub fn on_tick<'a>(&mut self, dev: &mut Device) -> Result<()> {
+        let n_unacked = self.snd.nxt.wrapping_sub(self.snd.una);
+        let n_unsent = self.data_out.len() - n_unacked as usize;
+
+        // RFC: 793, section: 3.7
+        let elapsed = self.timers.last_send.elapsed();
+        if elapsed > Duration::from_secs(1) && elapsed < self.timers.srtt.mul_f32(1.5) {
+            // retransmit
+            let n_resend = min(self.data_out.len(), self.snd.wnd as usize);
+            self.write(dev, &self.data_out[..n_resend])?;
+            self.snd.nxt = self.snd.una.wrapping_add(self.snd.wnd as u32);
+        } else {
+            // send new data
+            if n_unsent == 0 {
+                return Ok(());
+            }
+            let n_allowed = self.snd.wnd - n_unacked;
+            if n_allowed == 0 {
+                return Ok(());
+            }
+            self.write(dev, &self.data_out[n_unacked..(n_unacked + n_allowed)])?;
+           self.snd.nxt = self.snd.nxt.wrapping_add(n_allowed);
+        }
+        // If no SENDs have been issued and there is no pending data to send,
+        // then form a FIN segment and send it, and enter FIN-WAIT-1 state;
+        // otherwise queue for processing after entering ESTABLISHED state.
+        Ok(())
     }
 
     pub fn on_packet<'a>(
@@ -170,6 +218,7 @@ impl Connection {
         //     >0      >0     RCV.NXT =< SEG.SEQ < RCV.NXT+RCV.WND
         //                 or RCV.NXT =< SEG.SEQ+SEG.LEN-1 < RCV.NXT+RCV.WND
         // zero-length segment has separate rules for acceptance
+        // todo: rename and refactor
         let ok = if data_len == 0 {
             if self.rcv.wnd == 0 {
                 if seq != self.rcv.nxt { false } else { true }
@@ -197,14 +246,15 @@ impl Connection {
         };
 
         if !ok {
-            self.write(dev, &[])?;
+            self.write(dev, self.snd.nxt, &[])?;
             return Ok(self.available_io());
         }
 
-        self.rcv.nxt = seq.wrapping_add(data_len);
-
         // todo: why is it not in the beginning?
         if !tcp_req_header.ack() {
+            if tcp_req_header.syn() {
+                self.rcv.nxt = seq.wrapping_add(1);
+            }
             return Ok(self.available_io());
         }
 
@@ -235,16 +285,13 @@ impl Connection {
             if is_between_wrapped(self.snd.una, ack, self.snd.nxt.wrapping_add(1)) {
                 self.snd.una = ack;
             }
-            assert!(data.is_empty());
 
-            self.data_in.extend(data);
-
-            // if let State::Established = self.state {
-            //     // terminate connection
-            //     self.tcp_resp_header.fin = true;
-            //     self.write(dev, &[])?;
-            //     self.state = State::FinWait1;
-            // }
+            if let State::Established = self.state {
+                // terminate connection
+                self.tcp_resp_header.fin = true;
+                // self.write(dev, &[])?;
+                self.state = State::FinWait1;
+            }
         }
 
         if let State::FinWait1 = self.state {
@@ -257,11 +304,33 @@ impl Connection {
             self.state = State::FinWait2;
         }
 
+        if let State::Established | State::FinWait1 | State::FinWait2 = self.state {
+            let mut unread_data_idx = (self.rcv.nxt - seq) as usize;
+            if unread_data_idx > data_len as usize {
+                // We must have received a retransmitted FIN we have already seen.
+                // rcv.nxt points beyond FIN, but fin is not in data.
+                unread_data_idx = 0;
+            }
+            self.data_in.extend(&data[unread_data_idx..]);
+
+            // Once the TCP takes responsibility for the data it advances
+            // RCV.NXT over the data accepted, and adjusts RCV.WND as
+            // appropriate to the current buffer availability. The total of
+            // RCV.NXT and RCV.WND should not be reduced.
+            self.rcv.nxt = seq
+                .wrapping_add(data_len)
+                .wrapping_add(if tcp_req_header.fin() { 1 } else { 0 });
+
+            // send an acknowledgment of the form:
+            // <SEQ=SND.NXT><ACK=RCV.NXT><CTL=ACK>
+            self.write(dev, self.snd.nxt, &[])?;
+        }
+
         if tcp_req_header.fin() {
             match self.state {
                 State::FinWait2 => {
                     // done with the connection
-                    self.write(dev, &[])?;
+                    self.write(dev, self.snd.nxt, &[])?;
                     self.state = State::TimeWait;
                 }
                 _ => unimplemented!(),
@@ -271,10 +340,10 @@ impl Connection {
         Ok(self.available_io())
     }
 
-    fn write<'a>(&mut self, dev: &mut Device, payload: &'a [u8]) -> Result<usize> {
+    fn write<'a>(&mut self, dev: &mut Device, seq_num: u32, payload: &'a [u8]) -> Result<usize> {
         let mut buf = [0u8; 4096];
 
-        self.tcp_resp_header.sequence_number = self.snd.nxt;
+        self.tcp_resp_header.sequence_number = seq_num;
         self.tcp_resp_header.acknowledgment_number = self.rcv.nxt;
 
         let size = min(
@@ -296,15 +365,21 @@ impl Connection {
         self.tcp_resp_header.write(&mut unwritten)?;
         let n_payload_bytes = unwritten.write(payload)?;
 
-        self.snd.nxt = self.snd.nxt.wrapping_add(n_payload_bytes as u32);
+        let mut next_seq_num = seq_num.wrapping_add(n_payload_bytes as u32);
         if self.tcp_resp_header.syn {
-            self.snd.nxt = self.snd.nxt.wrapping_add(1);
+            next_seq_num = next_seq_num.wrapping_add(1);
             self.tcp_resp_header.syn = false;
         }
         if self.tcp_resp_header.fin {
-            self.snd.nxt = self.snd.nxt.wrapping_add(1);
+            next_seq_num = next_seq_num.wrapping_add(1);
             self.tcp_resp_header.fin = false;
         }
+
+        if wrapping_less_than(self.snd.nxt, next_seq_num) {
+            self.snd.nxt = next_seq_num;
+        }
+
+        self.snd.nxt = self.snd.nxt.wrapping_add(n_payload_bytes as u32);
 
         let unwritten_len = unwritten.len();
         let data_len = buf.len() - unwritten_len;
@@ -332,7 +407,7 @@ impl Connection {
         self.tcp_resp_header.rst = true;
         self.tcp_resp_header.sequence_number = 0;
         self.tcp_resp_header.acknowledgment_number = 0;
-        self.write(dev, &[])?;
+        self.write(dev, self.snd.nxt, &[])?;
         Ok(())
     }
 
@@ -349,6 +424,10 @@ impl Connection {
             aio.insert(AvailableIo::READ);
         }
         aio
+    }
+
+    pub(crate) fn close(&mut self) {
+        self.closed = true;
     }
 }
 
@@ -385,17 +464,17 @@ fn is_between_wrapped(start: u32, between: u32, end: u32) -> bool {
     true
 }
 
-// fn wrapping_less_than(lhs: u32, rhs: u32) -> bool {
-//     // From RFC1323:
-//     // TCP determines if a data segment is "old" or "new" by testing
-//     // whether its sequence number is within 2**31 bytes of the left edge
-//     // of the window, and if it is not, discarding the data as "old". To
-//     // ensure that new data is never mistakenly considered old and vice-
-//     // versa, the left edge of the sender's window has to be at most
-//     // 2**31 away from the right edge of the receiver's window.
-//     lhs.wrapping_sub(rhs) > (1 << 31)
-// }
-//
+fn wrapping_less_than(lhs: u32, rhs: u32) -> bool {
+    // From RFC1323:
+    // TCP determines if a data segment is "old" or "new" by testing
+    // whether its sequence number is within 2**31 bytes of the left edge
+    // of the window, and if it is not, discarding the data as "old". To
+    // ensure that new data is never mistakenly considered old and vice-
+    // versa, the left edge of the sender's window has to be at most
+    // 2**31 away from the right edge of the receiver's window.
+    lhs.wrapping_sub(rhs) > (1 << 31)
+}
+
 // fn is_between_wrapped(start: u32, between: u32, end: u32) -> bool {
 //     wrapping_less_than(start, between) && wrapping_less_than(between, end)
 // }

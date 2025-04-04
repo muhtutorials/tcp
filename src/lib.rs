@@ -1,9 +1,11 @@
 use etherparse::{Ipv4HeaderSlice, TcpHeaderSlice};
+use nix::poll::{PollFd, PollFlags, poll};
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, VecDeque};
 use std::io::prelude::*;
 use std::io::{Error, ErrorKind, Result};
-use std::net::{Ipv4Addr, Shutdown};
+use std::net::Ipv4Addr;
+use std::os::fd::{AsRawFd, BorrowedFd};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::thread::JoinHandle;
@@ -27,6 +29,7 @@ struct AddrPair {
     dst: (Ipv4Addr, u16),
 }
 
+// todo: come up with a better naming
 #[derive(Default)]
 struct ConnManagerInner {
     conns: HashMap<AddrPair, Connection>,
@@ -49,6 +52,7 @@ type ConnManager = Arc<ConnManagerBlock>;
 
 pub struct Interface {
     conn_manager: Option<ConnManager>,
+    // todo: rename to packet_handle
     handle: Option<JoinHandle<Result<()>>>,
 }
 
@@ -115,6 +119,17 @@ fn packet_loop(mut dev: Device, cm: ConnManager) -> Result<()> {
     let mut buf = [0u8; 4096];
 
     loop {
+        let borrowed_fd = unsafe { BorrowedFd::borrow_raw(dev.as_raw_fd()) };
+        let mut fds = [PollFd::new(borrowed_fd, PollFlags::POLLIN)];
+        let n = poll(&mut fds[..], 1u8).map_err(|err| Error::new(ErrorKind::Other, err))?;
+        if n == 0 {
+            let mut conn_manager = cm.mutex.lock().unwrap();
+            for conn in conn_manager.conns {
+                conn.on_tick(&mut dev)?;
+            }
+            continue;
+        }
+
         let n_bytes = dev.read(&mut buf)?;
 
         if let Ok(ip_req_header) = Ipv4HeaderSlice::from_slice(&buf) {
@@ -134,7 +149,7 @@ fn packet_loop(mut dev: Device, cm: ConnManager) -> Result<()> {
                 let mut conn_manager_mg = cm.mutex.lock().unwrap();
                 // extracts conn_manager from mutex to make borrow checker see
                 // that conn_manager.conns and conn_manager.pending are different "objects"
-                let mut conn_manager = &mut *conn_manager_mg;
+                let conn_manager = &mut *conn_manager_mg;
                 let addr_pair = AddrPair {
                     src: (src_addr, tcp_req_header.source_port()),
                     dst: (dst_addr, tcp_req_header.destination_port()),
@@ -143,7 +158,7 @@ fn packet_loop(mut dev: Device, cm: ConnManager) -> Result<()> {
 
                 match conn_manager.conns.entry(addr_pair) {
                     Entry::Occupied(mut entry) => {
-                        let aio =  entry.get_mut().on_packet(
+                        let aio = entry.get_mut().on_packet(
                             &mut dev,
                             ip_req_header,
                             tcp_req_header,

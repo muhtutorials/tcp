@@ -10,6 +10,14 @@ pub struct TcpStream {
 
 impl TcpStream {
     pub fn shutdown(&self, how: Shutdown) -> std::io::Result<()> {
+        let mut conn_manager = self.conn_manager.mutex.lock().unwrap();
+        let conn = conn_manager.conns.get_mut(&self.addr_pair).ok_or_else(|| {
+            Error::new(
+                ErrorKind::ConnectionAborted,
+                "stream was terminated unexpectedly",
+            )
+        })?;
+        conn.close();
         Ok(())
     }
 }
@@ -29,21 +37,21 @@ impl Read for TcpStream {
             if conn.is_received_closed() && conn.data_in.is_empty() {
                 // no more data to read and no need to block because there won't
                 // any more data
-                return Ok(0)
+                return Ok(0);
             };
 
             if !conn.data_in.is_empty() {
                 let mut n_bytes = 0;
                 let (head, tail) = conn.data_in.as_slices();
                 let head_read = min(buf.len(), head.len());
-                buf.copy_from_slice(&head[..head_read]);
+                buf[..head_read].copy_from_slice(&head[..head_read]);
                 n_bytes += head_read;
                 let tail_read = min(buf.len() - head_read, tail.len());
-                buf.copy_from_slice(&head[..tail_read]);
+                buf[head_read..(head_read + tail_read)].copy_from_slice(&tail[..tail_read]);
                 n_bytes += tail_read;
                 drop(conn.data_in.drain(..n_bytes));
 
-                return Ok(n_bytes)
+                return Ok(n_bytes);
             };
 
             conn_manager = self.conn_manager.read_notify.wait(conn_manager).unwrap();
