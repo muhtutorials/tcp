@@ -1,8 +1,9 @@
+use crate::utils::RingBuffer;
 use bitflags::bitflags;
 use core::time;
 use etherparse::{IpNumber, Ipv4Header, Ipv4HeaderSlice, TcpHeader, TcpHeaderSlice};
 use std::cmp::min;
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::io::{Error, ErrorKind, Result, Write};
 use std::time::{Duration, Instant};
 use tun::Device;
@@ -18,7 +19,9 @@ pub struct Connection {
     // unACKed by remote data
     pub data_out: VecDeque<u8>,
     timers: Timers,
-    closed: bool,
+    // sequence number of FIN byte if set
+    is_closed: bool,
+    closed_at: Option<u32>,
 }
 
 pub enum State {
@@ -79,8 +82,7 @@ struct ReceiveSequence {
 }
 
 struct Timers {
-    last_send: Instant,
-    send_times: VecDeque<(u32, Instant)>,
+    send_times: BTreeMap<u32, Instant>,
     /// Smoothed Round Trip Time
     srtt: Duration,
 }
@@ -142,42 +144,66 @@ impl Connection {
             data_in: VecDeque::new(),
             data_out: VecDeque::new(),
             timers: Timers {
-                last_send: Instant::now(),
-                send_times: VecDeque::new(),
+                send_times: BTreeMap::new(),
                 srtt: time::Duration::from_secs(60),
             },
-            closed: false,
+            is_closed: false,
+            closed_at: None,
         };
 
         conn.tcp_resp_header.syn = true;
         conn.tcp_resp_header.ack = true;
-        conn.write(dev, conn.snd.nxt, &[])?;
+        conn.write(dev, conn.snd.nxt, 0)?;
 
         Ok(Some(conn))
     }
 
     pub fn on_tick<'a>(&mut self, dev: &mut Device) -> Result<()> {
+        let (mut head, mut tail) = self.data_out.as_slices();
+        // todo: probably change "n_"'s
         let n_unacked = self.snd.nxt.wrapping_sub(self.snd.una);
         let n_unsent = self.data_out.len() - n_unacked as usize;
 
         // RFC: 793, section: 3.7
-        let elapsed = self.timers.last_send.elapsed();
-        if elapsed > Duration::from_secs(1) && elapsed < self.timers.srtt.mul_f32(1.5) {
+        // the oldest unacked seq
+        // todo: look into this expression
+        let elapsed = self
+            .timers
+            .send_times
+            .range(self.snd.una..)
+            .next()
+            .map(|val| val.1.elapsed());
+
+        let should_retrasmit = if let Some(elapsed) = elapsed {
+            elapsed > Duration::from_secs(1) && elapsed < self.timers.srtt.mul_f32(1.5)
+        } else {
+            false
+        };
+
+        if should_retrasmit {
             // retransmit
             let n_resend = min(self.data_out.len(), self.snd.wnd as usize);
-            self.write(dev, &self.data_out[..n_resend])?;
-            self.snd.nxt = self.snd.una.wrapping_add(self.snd.wnd as u32);
+            if n_resend < self.snd.wnd as usize && self.is_closed {
+                self.tcp_resp_header.fin = true;
+                self.closed_at = Some(self.snd.una.wrapping_add(self.data_out.len() as u32));
+            }
+            self.write(dev, self.snd.una, n_resend)?;
         } else {
             // send new data
-            if n_unsent == 0 {
+            if n_unsent == 0 && !self.closed_at.is_some() {
                 return Ok(());
             }
-            let n_allowed = self.snd.wnd - n_unacked;
+            let n_allowed = self.snd.wnd as u32 - n_unacked;
             if n_allowed == 0 {
                 return Ok(());
             }
-            self.write(dev, &self.data_out[n_unacked..(n_unacked + n_allowed)])?;
-           self.snd.nxt = self.snd.nxt.wrapping_add(n_allowed);
+            let n_send = min(n_unsent as u32, n_allowed);
+            if n_send < n_allowed && self.is_closed && self.closed_at.is_none() {
+                self.tcp_resp_header.fin = true;
+                self.closed_at = Some(self.snd.una.wrapping_add(self.data_out.len() as u32));
+            }
+
+            self.write(dev, self.snd.nxt, n_send as usize)?;
         }
         // If no SENDs have been issued and there is no pending data to send,
         // then form a FIN segment and send it, and enter FIN-WAIT-1 state;
@@ -246,7 +272,7 @@ impl Connection {
         };
 
         if !ok {
-            self.write(dev, self.snd.nxt, &[])?;
+            self.write(dev, self.snd.nxt, 0)?;
             return Ok(self.available_io());
         }
 
@@ -289,7 +315,6 @@ impl Connection {
             if let State::Established = self.state {
                 // terminate connection
                 self.tcp_resp_header.fin = true;
-                // self.write(dev, &[])?;
                 self.state = State::FinWait1;
             }
         }
@@ -323,14 +348,14 @@ impl Connection {
 
             // send an acknowledgment of the form:
             // <SEQ=SND.NXT><ACK=RCV.NXT><CTL=ACK>
-            self.write(dev, self.snd.nxt, &[])?;
+            self.write(dev, self.snd.nxt, 0)?;
         }
 
         if tcp_req_header.fin() {
             match self.state {
                 State::FinWait2 => {
                     // done with the connection
-                    self.write(dev, self.snd.nxt, &[])?;
+                    self.write(dev, self.snd.nxt, 0)?;
                     self.state = State::TimeWait;
                 }
                 _ => unimplemented!(),
@@ -340,15 +365,26 @@ impl Connection {
         Ok(self.available_io())
     }
 
-    fn write<'a>(&mut self, dev: &mut Device, seq_num: u32, payload: &'a [u8]) -> Result<usize> {
+    fn write<'a>(&mut self, dev: &mut Device, seq_num: u32, limit: usize) -> Result<usize> {
         let mut buf = [0u8; 4096];
 
         self.tcp_resp_header.sequence_number = seq_num;
         self.tcp_resp_header.acknowledgment_number = self.rcv.nxt;
 
+        let (mut head, mut tail) = self.data_out.as_slices();
+        let offset = seq_num.wrapping_sub(self.snd.una);
+        if head.len() >= offset as usize {
+            head = &head[offset as usize..]
+        } else {
+            let skipped = head.len();
+            head = &[];
+            tail = &tail[(offset as usize - skipped)..]
+        }
+
+        let mut limit = min(limit, head.len() + tail.len());
         let size = min(
             buf.len(),
-            self.ip_resp_header.header_len() + self.tcp_resp_header.header_len() + payload.len(),
+            self.ip_resp_header.header_len() + self.tcp_resp_header.header_len() + limit,
         );
 
         self.ip_resp_header
@@ -363,7 +399,19 @@ impl Connection {
         let mut unwritten = &mut buf[..];
         self.ip_resp_header.write(&mut unwritten)?;
         self.tcp_resp_header.write(&mut unwritten)?;
-        let n_payload_bytes = unwritten.write(payload)?;
+        let n_payload_bytes = {
+            let mut written = 0;
+            limit = min(limit, head.len() + tail.len());
+
+            let head_end = min(limit, head.len());
+            written += unwritten.write(&head[..head_end])?;
+            limit -= written;
+
+            let tail_end = min(limit, tail.len());
+            written += unwritten.write(&head[..tail_end])?;
+
+            written
+        };
 
         let mut next_seq_num = seq_num.wrapping_add(n_payload_bytes as u32);
         if self.tcp_resp_header.syn {
@@ -379,7 +427,7 @@ impl Connection {
             self.snd.nxt = next_seq_num;
         }
 
-        self.snd.nxt = self.snd.nxt.wrapping_add(n_payload_bytes as u32);
+        self.timers.send_times.insert(seq_num, Instant::now());
 
         let unwritten_len = unwritten.len();
         let data_len = buf.len() - unwritten_len;
@@ -407,7 +455,7 @@ impl Connection {
         self.tcp_resp_header.rst = true;
         self.tcp_resp_header.sequence_number = 0;
         self.tcp_resp_header.acknowledgment_number = 0;
-        self.write(dev, self.snd.nxt, &[])?;
+        self.write(dev, self.snd.nxt, 0)?;
         Ok(())
     }
 
@@ -426,8 +474,16 @@ impl Connection {
         aio
     }
 
-    pub(crate) fn close(&mut self) {
-        self.closed = true;
+    pub(crate) fn close(&mut self) -> Result<()> {
+        self.is_closed = true;
+        match self.state {
+            State::SynReceived | State::Established => {
+                self.state = State::FinWait1;
+            }
+            State::FinWait1 | State::FinWait2 => {}
+            _ => return Err(Error::new(ErrorKind::NotConnected, "already closing")),
+        }
+        Ok(())
     }
 }
 

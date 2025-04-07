@@ -20,6 +20,8 @@ use listener::TcpListener;
 pub mod stream;
 pub use stream::TcpStream;
 
+pub mod utils;
+
 const SEND_QU_SIZE: usize = 1024;
 
 #[derive(Debug, Copy, Clone, Hash, Eq, PartialEq)]
@@ -124,7 +126,7 @@ fn packet_loop(mut dev: Device, cm: ConnManager) -> Result<()> {
         let n = poll(&mut fds[..], 1u8).map_err(|err| Error::new(ErrorKind::Other, err))?;
         if n == 0 {
             let mut conn_manager = cm.mutex.lock().unwrap();
-            for conn in conn_manager.conns {
+            for conn in conn_manager.conns.values_mut() {
                 conn.on_tick(&mut dev)?;
             }
             continue;

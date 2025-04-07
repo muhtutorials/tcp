@@ -1,6 +1,6 @@
 use crate::{AddrPair, ConnManager, SEND_QU_SIZE};
 use std::cmp::min;
-use std::io::{Error, ErrorKind, Read, Write};
+use std::io::{Error, ErrorKind, Read, Result, Write};
 use std::net::Shutdown;
 
 pub struct TcpStream {
@@ -9,7 +9,7 @@ pub struct TcpStream {
 }
 
 impl TcpStream {
-    pub fn shutdown(&self, how: Shutdown) -> std::io::Result<()> {
+    pub fn shutdown(&self, how: Shutdown) -> Result<()> {
         let mut conn_manager = self.conn_manager.mutex.lock().unwrap();
         let conn = conn_manager.conns.get_mut(&self.addr_pair).ok_or_else(|| {
             Error::new(
@@ -17,13 +17,12 @@ impl TcpStream {
                 "stream was terminated unexpectedly",
             )
         })?;
-        conn.close();
-        Ok(())
+        conn.close()
     }
 }
 
 impl Read for TcpStream {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
         let mut conn_manager = self.conn_manager.mutex.lock().unwrap();
 
         loop {
@@ -43,12 +42,15 @@ impl Read for TcpStream {
             if !conn.data_in.is_empty() {
                 let mut n_bytes = 0;
                 let (head, tail) = conn.data_in.as_slices();
-                let head_read = min(buf.len(), head.len());
-                buf[..head_read].copy_from_slice(&head[..head_read]);
-                n_bytes += head_read;
-                let tail_read = min(buf.len() - head_read, tail.len());
-                buf[head_read..(head_read + tail_read)].copy_from_slice(&tail[..tail_read]);
-                n_bytes += tail_read;
+
+                let head_end = min(buf.len(), head.len());
+                buf[..head_end].copy_from_slice(&head[..head_end]);
+                n_bytes += head_end;
+
+                let tail_end = min(buf.len() - head_end, tail.len());
+                buf[head_end..(head_end + tail_end)].copy_from_slice(&tail[..tail_end]);
+                n_bytes += tail_end;
+                
                 drop(conn.data_in.drain(..n_bytes));
 
                 return Ok(n_bytes);
@@ -60,7 +62,7 @@ impl Read for TcpStream {
 }
 
 impl Write for TcpStream {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+    fn write(&mut self, buf: &[u8]) -> Result<usize> {
         let mut conn_manager = self.conn_manager.mutex.lock().unwrap();
         let conn = conn_manager.conns.get_mut(&self.addr_pair).ok_or_else(|| {
             Error::new(
@@ -83,7 +85,7 @@ impl Write for TcpStream {
         Ok(n_bytes)
     }
 
-    fn flush(&mut self) -> std::io::Result<()> {
+    fn flush(&mut self) -> Result<()> {
         let mut conn_manager = self.conn_manager.mutex.lock().unwrap();
         let conn = conn_manager.conns.get_mut(&self.addr_pair).ok_or_else(|| {
             Error::new(
