@@ -1,6 +1,7 @@
 use crate::utils::RingBuffer;
 use bitflags::bitflags;
 use core::time;
+use etherparse::err::ip;
 use etherparse::{IpNumber, Ipv4Header, Ipv4HeaderSlice, TcpHeader, TcpHeaderSlice};
 use std::cmp::min;
 use std::collections::{BTreeMap, VecDeque};
@@ -17,6 +18,7 @@ pub struct Connection {
     // todo: make it pub(crate)
     pub data_in: VecDeque<u8>,
     // unACKed by remote data
+    // todo: rename it?
     pub data_out: VecDeque<u8>,
     timers: Timers,
     // sequence number of FIN byte if set
@@ -159,9 +161,15 @@ impl Connection {
     }
 
     pub fn on_tick<'a>(&mut self, dev: &mut Device) -> Result<()> {
-        let (mut head, mut tail) = self.data_out.as_slices();
+        if let State::FinWait2 | State::TimeWait = self.state {
+            // we have shutdown our write side and the other side acked, no need to (re)transmit anything
+            return Ok(());
+        }
         // todo: probably change "n_"'s
-        let n_unacked = self.snd.nxt.wrapping_sub(self.snd.una);
+        let n_unacked = self
+            .closed_at
+            .unwrap_or(self.snd.nxt)
+            .wrapping_sub(self.snd.una);
         let n_unsent = self.data_out.len() - n_unacked as usize;
 
         // RFC: 793, section: 3.7
@@ -175,13 +183,12 @@ impl Connection {
             .map(|val| val.1.elapsed());
 
         let should_retrasmit = if let Some(elapsed) = elapsed {
-            elapsed > Duration::from_secs(1) && elapsed < self.timers.srtt.mul_f32(1.5)
+            elapsed > Duration::from_secs(1) && elapsed > self.timers.srtt.mul_f32(1.5)
         } else {
             false
         };
 
         if should_retrasmit {
-            // retransmit
             let n_resend = min(self.data_out.len(), self.snd.wnd as usize);
             if n_resend < self.snd.wnd as usize && self.is_closed {
                 self.tcp_resp_header.fin = true;
@@ -190,7 +197,7 @@ impl Connection {
             self.write(dev, self.snd.una, n_resend)?;
         } else {
             // send new data
-            if n_unsent == 0 && !self.closed_at.is_some() {
+            if n_unsent == 0 && self.closed_at.is_some() {
                 return Ok(());
             }
             let n_allowed = self.snd.wnd as u32 - n_unacked;
@@ -309,52 +316,69 @@ impl Connection {
             // self.snd.nxt.wrapping_add(1) makes nxt inclusive in comparison.
             // Makes is_between_wrapped more generic.
             if is_between_wrapped(self.snd.una, ack, self.snd.nxt.wrapping_add(1)) {
-                self.snd.una = ack;
-            }
+                if !self.data_out.is_empty() {
+                    let data_start = if self.snd.una == self.snd.iss {
+                        // snd.una hasn't been updated yet with ACK for our SYN, so data starts just beyond it
+                        self.snd.una.wrapping_add(1)
+                    } else {
+                        self.snd.una
+                    };
+                    let acked_data_end =
+                        min(ack.wrapping_sub(data_start) as usize, self.data_out.len());
 
-            if let State::Established = self.state {
-                // terminate connection
-                self.tcp_resp_header.fin = true;
-                self.state = State::FinWait1;
+                    self.data_out.drain(..acked_data_end);
+
+                    self.timers.send_times.retain(|seq, sent| {
+                        if is_between_wrapped(self.snd.una, *seq, ack) {
+                            let rtt = sent.elapsed();
+                            // SRTT = ( ALPHA * SRTT ) + ((1-ALPHA) * RTT)
+                            self.timers.srtt =
+                                self.timers.srtt.mul_f64(0.8) + rtt.mul_f64(1.0 - 0.8);
+                            return false;
+                        }
+                        true
+                    });
+                }
+                self.snd.una = ack;
             }
         }
 
         if let State::FinWait1 = self.state {
-            if self.snd.una == self.snd.iss + 2 {
-                // our FIN has been ACKed
-                self.state = State::FinWait2;
+            if let Some(closed_at) = self.closed_at {
+                if self.snd.una == closed_at.wrapping_add(1) {
+                    // our FIN has been ACKed
+                    self.state = State::FinWait2;
+                }
             }
-            // Must have acked our FIN, since we detected at least one acked byte,
-            // and we have only sent one byte (the FIN).
-            self.state = State::FinWait2;
         }
 
-        if let State::Established | State::FinWait1 | State::FinWait2 = self.state {
-            let mut unread_data_idx = (self.rcv.nxt - seq) as usize;
-            if unread_data_idx > data_len as usize {
-                // We must have received a retransmitted FIN we have already seen.
-                // rcv.nxt points beyond FIN, but fin is not in data.
-                unread_data_idx = 0;
+        if !data.is_empty() {
+            if let State::Established | State::FinWait1 | State::FinWait2 = self.state {
+                let mut unread_data_idx = self.rcv.nxt.wrapping_sub(seq) as usize;
+                if unread_data_idx > data_len as usize {
+                    // We must have received a retransmitted FIN we have already seen.
+                    // rcv.nxt points beyond FIN, but fin is not in data.
+                    unread_data_idx = 0;
+                }
+                self.data_in.extend(&data[unread_data_idx..]);
+
+                // Once the TCP takes responsibility for the data it advances
+                // RCV.NXT over the data accepted, and adjusts RCV.WND as
+                // appropriate to the current buffer availability. The total of
+                // RCV.NXT and RCV.WND should not be reduced.
+                self.rcv.nxt = seq.wrapping_add(data_len);
+
+                // send an acknowledgment of the form:
+                // <SEQ=SND.NXT><ACK=RCV.NXT><CTL=ACK>
+                self.write(dev, self.snd.nxt, 0)?;
             }
-            self.data_in.extend(&data[unread_data_idx..]);
-
-            // Once the TCP takes responsibility for the data it advances
-            // RCV.NXT over the data accepted, and adjusts RCV.WND as
-            // appropriate to the current buffer availability. The total of
-            // RCV.NXT and RCV.WND should not be reduced.
-            self.rcv.nxt = seq
-                .wrapping_add(data_len)
-                .wrapping_add(if tcp_req_header.fin() { 1 } else { 0 });
-
-            // send an acknowledgment of the form:
-            // <SEQ=SND.NXT><ACK=RCV.NXT><CTL=ACK>
-            self.write(dev, self.snd.nxt, 0)?;
         }
 
         if tcp_req_header.fin() {
             match self.state {
                 State::FinWait2 => {
                     // done with the connection
+                    self.rcv.nxt = seq.wrapping_add(1);
                     self.write(dev, self.snd.nxt, 0)?;
                     self.state = State::TimeWait;
                 }
@@ -365,14 +389,23 @@ impl Connection {
         Ok(self.available_io())
     }
 
-    fn write<'a>(&mut self, dev: &mut Device, seq_num: u32, limit: usize) -> Result<usize> {
+    fn write<'a>(&mut self, dev: &mut Device, seq_num: u32, mut limit: usize) -> Result<usize> {
+        // todo: maybe try bytes crate and cursor instead
         let mut buf = [0u8; 4096];
+        let buf_len = buf.len();
 
         self.tcp_resp_header.sequence_number = seq_num;
         self.tcp_resp_header.acknowledgment_number = self.rcv.nxt;
 
+        let mut offset = seq_num.wrapping_sub(self.snd.una);
+        if let Some(closed_at) = self.closed_at {
+            if seq_num == closed_at.wrapping_add(1) {
+                offset = 0;
+                limit = 0;
+            }
+        }
+
         let (mut head, mut tail) = self.data_out.as_slices();
-        let offset = seq_num.wrapping_sub(self.snd.una);
         if head.len() >= offset as usize {
             head = &head[offset as usize..]
         } else {
@@ -383,7 +416,7 @@ impl Connection {
 
         let mut limit = min(limit, head.len() + tail.len());
         let size = min(
-            buf.len(),
+            buf_len,
             self.ip_resp_header.header_len() + self.tcp_resp_header.header_len() + limit,
         );
 
@@ -391,27 +424,42 @@ impl Connection {
             .set_payload_len(size - self.ip_resp_header.header_len())
             .map_err(|err| Error::new(ErrorKind::InvalidInput, err))?;
 
-        self.tcp_resp_header.checksum = self
-            .tcp_resp_header
-            .calc_checksum_ipv4(&self.ip_resp_header, &[])
-            .expect("failed to compute checksum");
-
         let mut unwritten = &mut buf[..];
         self.ip_resp_header.write(&mut unwritten)?;
-        self.tcp_resp_header.write(&mut unwritten)?;
+        let ip_header_ends_at = buf_len - unwritten.len();
+
+        // postpone writing the tcp header because we need the payload
+        // as one contiguous slice to calculate the tcp checksum
+        unwritten = &mut unwritten[self.tcp_resp_header.header_len() as usize..];
+        let tcp_header_ends_at = buf_len - unwritten.len();
+
         let n_payload_bytes = {
             let mut written = 0;
-            limit = min(limit, head.len() + tail.len());
 
             let head_end = min(limit, head.len());
             written += unwritten.write(&head[..head_end])?;
             limit -= written;
 
             let tail_end = min(limit, tail.len());
-            written += unwritten.write(&head[..tail_end])?;
+            written += unwritten.write(&tail[..tail_end])?;
 
             written
         };
+
+        let payload_ends_at = buf_len - unwritten.len();
+
+        // finally we can calculate the tcp checksum and write out the tcp header
+        self.tcp_resp_header.checksum = self
+            .tcp_resp_header
+            .calc_checksum_ipv4(
+                &self.ip_resp_header,
+                &mut buf[ip_header_ends_at..payload_ends_at],
+            )
+            .expect("failed to compute checksum");
+
+        let mut tcp_header_buf = &mut buf[ip_header_ends_at..tcp_header_ends_at];
+        // tcp data has already been written, so we write just tcp header with calculated checksum
+        self.tcp_resp_header.write(&mut tcp_header_buf)?;
 
         let mut next_seq_num = seq_num.wrapping_add(n_payload_bytes as u32);
         if self.tcp_resp_header.syn {
@@ -429,9 +477,7 @@ impl Connection {
 
         self.timers.send_times.insert(seq_num, Instant::now());
 
-        let unwritten_len = unwritten.len();
-        let data_len = buf.len() - unwritten_len;
-        dev.send(&buf[..data_len])?;
+        dev.send(&buf[..payload_ends_at])?;
 
         Ok(n_payload_bytes)
     }

@@ -1,18 +1,19 @@
-use std::io::{Read, Result};
+use std::io::{Read, Result, Write};
 use std::net::Shutdown;
 use std::thread;
 use tcp::Interface;
 
 fn main() -> Result<()> {
     let mut iface = Interface::new()?;
-    let mut lis = iface.bind(8000)?;
+    let mut listener = iface.bind(8000)?;
 
-    let handle = thread::spawn(move || {
-        while let Ok(mut stream) = lis.accept() {
+    while let Ok(mut stream) = listener.accept() {
+        println!("got connection");
+        thread::spawn(move || {
+            stream.write(b"hi").unwrap();
             stream.shutdown(Shutdown::Write).unwrap();
             loop {
                 let mut buf = [0; 512];
-                println!("got connection on 8000");
                 let n = stream.read(&mut buf[..]).unwrap();
                 if n == 0 {
                     println!("no more data");
@@ -21,10 +22,8 @@ fn main() -> Result<()> {
                 println!("{n} bytes of data read");
                 println!("{:?}", &buf[..n]);
             }
-        }
-    });
-
-    handle.join().unwrap();
+        });
+    }
 
     Ok(())
 }
