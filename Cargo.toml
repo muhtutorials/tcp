@@ -10,7 +10,6 @@ name = "tcp"
 name = "tcp"
 
 [dependencies]
-bitflags = "2.9.0"
 etherparse = "0.17"
 nix = { version = "0.29.0", features = ["poll"] }
 tun = "0.7"

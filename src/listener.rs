@@ -32,7 +32,9 @@ impl Drop for TcpListener {
         let pending = conn_manager
             .pending
             .remove(&self.port)
-            .expect("port closed while listener still active");
-        for addr_pair in pending {}
+            .expect("port closed while listener is still active");
+        for addr_pair in pending {
+            unimplemented!()
+        }
     }
 }

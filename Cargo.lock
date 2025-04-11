@@ -373,7 +373,6 @@ dependencies = [
 name = "tcp"
 version = "0.1.0"
 dependencies = [
- "bitflags",
  "etherparse",
  "nix",
  "tun",

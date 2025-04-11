@@ -12,7 +12,7 @@ use std::thread::JoinHandle;
 use tun::Device;
 
 mod connection;
-use connection::{AvailableIo, Connection};
+use connection::Connection;
 
 mod listener;
 use listener::TcpListener;
@@ -21,6 +21,7 @@ pub mod stream;
 pub use stream::TcpStream;
 
 pub mod utils;
+use utils::{AvailableIo, IoFlag};
 
 const SEND_QU_SIZE: usize = 1024;
 
@@ -31,7 +32,6 @@ struct AddrPair {
     dst: (Ipv4Addr, u16),
 }
 
-// todo: come up with a better naming
 #[derive(Default)]
 struct ConnManagerInner {
     conns: HashMap<AddrPair, Connection>,
@@ -54,7 +54,6 @@ type ConnManager = Arc<ConnManagerBlock>;
 
 pub struct Interface {
     conn_manager: Option<ConnManager>,
-    // todo: rename to packet_handle
     handle: Option<JoinHandle<Result<()>>>,
 }
 
@@ -127,7 +126,7 @@ fn packet_loop(mut dev: Device, cm: ConnManager) -> Result<()> {
         if n == 0 {
             let mut conn_manager = cm.mutex.lock().unwrap();
             for conn in conn_manager.conns.values_mut() {
-                conn.on_tick(&mut dev)?;
+                conn.tick(&mut dev)?;
             }
             continue;
         }
@@ -156,24 +155,23 @@ fn packet_loop(mut dev: Device, cm: ConnManager) -> Result<()> {
                     src: (src_addr, tcp_req_header.source_port()),
                     dst: (dst_addr, tcp_req_header.destination_port()),
                 };
-                let data_idx = ip_req_header_len + tcp_req_header.slice().len();
+                let data_start_idx = ip_req_header_len + tcp_req_header.slice().len();
 
                 match conn_manager.conns.entry(addr_pair) {
                     Entry::Occupied(mut entry) => {
-                        let aio = entry.get_mut().on_packet(
+                        let aio = entry.get_mut().handle_packet(
                             &mut dev,
-                            ip_req_header,
                             tcp_req_header,
-                            &buf[data_idx..n_bytes],
+                            &buf[data_start_idx..n_bytes],
                         )?;
 
                         drop(conn_manager_mg);
 
-                        if aio.contains(AvailableIo::READ) {
+                        if aio.contains(IoFlag::Read) {
                             cm.read_notify.notify_all();
                         }
 
-                        if aio.contains(AvailableIo::WRITE) {
+                        if aio.contains(IoFlag::Write) {
                             cm.read_notify.notify_all();
                         }
                     }
@@ -186,7 +184,6 @@ fn packet_loop(mut dev: Device, cm: ConnManager) -> Result<()> {
                                 Connection::accept(&mut dev, ip_req_header, tcp_req_header)?
                             {
                                 entry.insert(conn);
-                                // todo: find out why the method can take by value
                                 pending.push_back(addr_pair);
                                 // release the lock so after waking up it's available
                                 drop(conn_manager_mg);

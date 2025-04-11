@@ -71,7 +71,6 @@ impl Write for TcpStream {
             )
         })?;
         if conn.data_out.len() >= SEND_QU_SIZE {
-            // todo: block
             return Err(Error::new(ErrorKind::WouldBlock, "too many bytes buffered"));
         }
 
