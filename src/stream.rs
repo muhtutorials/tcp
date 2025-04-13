@@ -33,9 +33,9 @@ impl Read for TcpStream {
                 )
             })?;
 
-            if conn.is_received_closed() && conn.data_in.is_empty() {
+            if conn.is_time_wait() && conn.data_in.is_empty() {
                 // no more data to read and no need to block because there won't
-                // any more data
+                // be any more data
                 return Ok(0);
             };
 
