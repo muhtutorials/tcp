@@ -35,8 +35,8 @@ struct AddrPair {
 #[derive(Default)]
 struct ConnManagerInner {
     conns: HashMap<AddrPair, Connection>,
-    // Key is a listener's port number.
-    // Value is a list of pending to be created connections with the listener.
+    // Key is the listener's port number.
+    // Value is a list of pending connections to be created with the listener.
     pending: HashMap<u16, VecDeque<AddrPair>>,
     shutdown: bool,
 }
@@ -60,6 +60,10 @@ pub struct Interface {
 impl Interface {
     pub fn new() -> Result<Self> {
         let mut config = tun::Configuration::default();
+        // sudo ip addr add 192.168.0.1/24 dev tun0
+        // sudo ip link set up dev tun0
+        // ping -I tun0 10.0.0.9
+        // interact with listener: nc -v 10.0.0.1 8000
         config
             .address((10, 0, 0, 9))
             .netmask((255, 255, 255, 0))
@@ -117,12 +121,12 @@ impl Drop for Interface {
 }
 
 fn packet_loop(mut dev: Device, cm: ConnManager) -> Result<()> {
-    let mut buf = [0u8; 4096];
+    let mut buf = [0u8; 1500];
 
     loop {
         let borrowed_fd = unsafe { BorrowedFd::borrow_raw(dev.as_raw_fd()) };
         let mut fds = [PollFd::new(borrowed_fd, PollFlags::POLLIN)];
-        let n = poll(&mut fds[..], 1u8).map_err(|err| Error::new(ErrorKind::Other, err))?;
+        let n = poll(&mut fds[..], 1000u16).map_err(|err| Error::new(ErrorKind::Other, err))?;
         if n == 0 {
             let mut conn_manager = cm.mutex.lock().unwrap();
             for conn in conn_manager.conns.values_mut() {
@@ -131,9 +135,9 @@ fn packet_loop(mut dev: Device, cm: ConnManager) -> Result<()> {
             continue;
         }
 
-        let n_bytes = dev.read(&mut buf)?;
+        let n_bytes = dev.read(&mut buf[..])?;
 
-        if let Ok(ip_req_header) = Ipv4HeaderSlice::from_slice(&buf) {
+        if let Ok(ip_req_header) = Ipv4HeaderSlice::from_slice(&buf[..n_bytes]) {
             // checks if it's a TCP
             // https://www.iana.org/assignments/protocol-numbers/protocol-numbers.xhtml
             let proto = ip_req_header.protocol();
@@ -157,6 +161,11 @@ fn packet_loop(mut dev: Device, cm: ConnManager) -> Result<()> {
                 };
                 let data_start_idx = ip_req_header_len + tcp_req_header.slice().len();
 
+                // println!("addr pair: {:?}", addr_pair);
+                // println!("data start index: {data_start_idx}");
+                // println!("number of bytes: {n_bytes}");
+                // println!("{:?}", &buf[..n_bytes]);
+
                 match conn_manager.conns.entry(addr_pair) {
                     Entry::Occupied(mut entry) => {
                         let aio = entry.get_mut().handle_packet(
@@ -172,7 +181,7 @@ fn packet_loop(mut dev: Device, cm: ConnManager) -> Result<()> {
                         }
 
                         if aio.contains(IoFlag::Write) {
-                            cm.read_notify.notify_all();
+                            unimplemented!()
                         }
                     }
                     Entry::Vacant(entry) => {

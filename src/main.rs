@@ -8,10 +8,10 @@ fn main() -> Result<()> {
     let mut listener = iface.bind(8000)?;
 
     while let Ok(mut stream) = listener.accept() {
-        println!("got connection");
+        // println!("got connection");
         thread::spawn(move || {
             stream.write(b"hi").unwrap();
-            stream.shutdown(Shutdown::Write).unwrap();
+            // stream.shutdown(Shutdown::Write).unwrap();
             loop {
                 let mut buf = [0; 512];
                 let n = stream.read(&mut buf[..]).unwrap();

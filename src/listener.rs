@@ -33,7 +33,8 @@ impl Drop for TcpListener {
             .pending
             .remove(&self.port)
             .expect("port closed while listener is still active");
-        for addr_pair in pending {
+        
+        for _addr_pair in pending {
             unimplemented!()
         }
     }

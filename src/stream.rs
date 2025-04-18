@@ -9,7 +9,7 @@ pub struct TcpStream {
 }
 
 impl TcpStream {
-    pub fn shutdown(&self, how: Shutdown) -> Result<()> {
+    pub fn shutdown(&self, _how: Shutdown) -> Result<()> {
         let mut conn_manager = self.conn_manager.mutex.lock().unwrap();
         let conn = conn_manager.conns.get_mut(&self.addr_pair).ok_or_else(|| {
             Error::new(
@@ -63,6 +63,7 @@ impl Read for TcpStream {
 
 impl Write for TcpStream {
     fn write(&mut self, buf: &[u8]) -> Result<usize> {
+        // println!("TcpStream.write => {:?}", String::from_utf8_lossy(buf));
         let mut conn_manager = self.conn_manager.mutex.lock().unwrap();
         let conn = conn_manager.conns.get_mut(&self.addr_pair).ok_or_else(|| {
             Error::new(
@@ -70,16 +71,15 @@ impl Write for TcpStream {
                 "stream was terminated unexpectedly",
             )
         })?;
+
         if conn.data_out.len() >= SEND_QU_SIZE {
             return Err(Error::new(ErrorKind::WouldBlock, "too many bytes buffered"));
         }
 
-        if conn.data_out.is_empty() {
-            return Err(Error::new(ErrorKind::WouldBlock, "no bytes to read"));
-        };
-
         let n_bytes = min(buf.len(), SEND_QU_SIZE - conn.data_out.len());
+        // println!("TcpStream.write => n_bytes: {n_bytes}");
         conn.data_out.extend(&buf[..n_bytes]);
+        // println!("TcpStream.write => conn.data_out: {:?}", conn.data_out);
 
         Ok(n_bytes)
     }
@@ -103,6 +103,6 @@ impl Write for TcpStream {
 
 impl Drop for TcpStream {
     fn drop(&mut self) {
-        let mut conn_manager = self.conn_manager.mutex.lock().unwrap();
+        let mut _conn_manager = self.conn_manager.mutex.lock().unwrap();
     }
 }

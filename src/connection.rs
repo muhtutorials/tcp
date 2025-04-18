@@ -18,10 +18,11 @@ pub struct Connection {
     pub(crate) data_out: VecDeque<u8>,
     timers: Timers,
     is_closed: bool,
-    // sequence number of FIN byte if set
+    // sequence number of FIN byte
     closed_at: Option<u32>,
 }
 
+#[derive(Debug)]
 pub enum State {
     SynReceived,
     Established,
@@ -41,12 +42,12 @@ pub enum State {
 /// 2 - sequence numbers of unacknowledged data
 /// 3 - sequence numbers allowed for new data transmission
 /// 4 - future sequence numbers which are not yet allowed
+#[derive(Debug)]
 struct SendVars {
     /// sequence number of unacknowledged data
     unacked_seq_num: u32,
-    /// sequence number sent from local -> acknowledgment number received from remote
+    /// sequence number sent from local = acknowledgment number + data length received from remote
     seq_num: u32,
-    /// send window
     window: u16,
     init_seq_num: u32,
 }
@@ -61,8 +62,9 @@ struct SendVars {
 /// 1 - old sequence numbers which have been acknowledged
 /// 2 - sequence numbers allowed for new reception
 /// 3 - future sequence numbers which are not yet allowed
+#[derive(Debug)]
 struct ReceiveVars {
-    /// receive next received sequence number from remote -> acknowledgment number sent
+    /// received sequence number from remote = acknowledgment number + data length sent from local
     seq_num: u32,
     // TCP provides a means for the receiver to govern the amount of data
     // sent by the sender. This is achieved by returning a "window" with
@@ -71,8 +73,6 @@ struct ReceiveVars {
     // allowed number of octets that the sender may transmit before
     // receiving further permission.
     window: u16,
-    /// initial receive sequence number
-    init_seq_num: u32,
 }
 
 struct Timers {
@@ -91,6 +91,7 @@ impl Connection {
         if !tcp_req_header.syn() {
             return Ok(None);
         }
+        println!("Connection.accept => recv.seq_num: {:?}", tcp_req_header.sequence_number());
 
         let init_seq_num = 0;
         let window = 1024;
@@ -105,7 +106,6 @@ impl Connection {
             recv: ReceiveVars {
                 seq_num: tcp_req_header.sequence_number() + 1,
                 window,
-                init_seq_num: tcp_req_header.sequence_number(),
             },
             ip_resp_header: Ipv4Header::new(
                 0, // set later
@@ -194,6 +194,10 @@ impl Connection {
             written
         };
 
+        // println!("Connection.write => state: {:?}", self.state);
+        // println!("Connection.write => seq_num: {seq_num}");
+        // println!("Connection.write => n_data_bytes: {n_data_bytes}");
+
         let ip_payload_end_idx = buf.position() as usize;
 
         let buf = buf.get_mut();
@@ -261,21 +265,42 @@ impl Connection {
         //
         //     >0      >0     RCV.NXT =< SEG.SEQ < RCV.NXT+RCV.WND (4 cond)
         //                 or RCV.NXT =< SEG.SEQ+SEG.LEN-1 < RCV.NXT+RCV.WND
-        // zero-length segment has separate rules for acceptance
-        // acceptable incoming sequence number
+        // self.recv.seq_num.wrapping_sub(1) turns "<" to "<=" inside "is_between_wrapped" function
+        println!("Connection.handle_packet => self.state: {:?}", self.state);
+        println!("Connection.handle_packet => self.recv.seq_num.wrapping_sub(1): {:?}", self.recv.seq_num.wrapping_sub(1));
+        println!("Connection.handle_packet => incoming_seq_num: {incoming_seq_num}");
+        println!("Connection.handle_packet => window_end: {window_end}");
+        println!("Connection.handle_packet => self.recv.seq_num.wrapping_sub(1): {:?}", self.recv.seq_num.wrapping_sub(1));
+        println!("Connection.handle_packet => data_len: {data_len}");
+        println!("Connection.handle_packet => incoming_seq_num.wrapping_add(data_len - 1): {incoming_seq_num}");
+        println!("Connection.handle_packet => window_end: {window_end}");
         let acceptable_incoming_seq_num = if data_len == 0 {
+            println!("1");
             if self.recv.window == 0 {
                 // 0 0 (1 cond)
-                if incoming_seq_num == self.recv.seq_num { true } else { false }
+                if incoming_seq_num == self.recv.seq_num {
+                    println!("2");
+                    true
+                } else {
+                    println!("3");
+                    false
+                }
                 // 0 >0 (2 cond)
-            } else if is_between_wrapped(self.recv.seq_num.wrapping_sub(1), incoming_seq_num, window_end) { 
+            } else if is_between_wrapped(
+                self.recv.seq_num.wrapping_sub(1),
+                incoming_seq_num,
+                window_end,
+            ) {
+                println!("4");
                 true
             } else {
+                println!("5");
                 false
             }
         } else {
-             // >0 0 (3 cond)
+            // >0 0 (3 cond)
             if self.recv.window == 0 {
+                println!("6");
                 false
             // The first part of this test checks to see if the beginning of the
             // segment falls in the window, the second part of the test checks to see
@@ -284,20 +309,31 @@ impl Connection {
             // RCV.NXT =< SEG.SEQ < RCV.NXT+RCV.WND
             // RCV.NXT =< SEG.SEQ+SEG.LEN-1 < RCV.NXT+RCV.WND
             // >0 >0 (4 cond)
-            } else if is_between_wrapped(self.recv.seq_num.wrapping_sub(1), incoming_seq_num, window_end)
-                && is_between_wrapped(self.recv.seq_num.wrapping_sub(1), incoming_seq_num.wrapping_add(data_len - 1), window_end)
-            {
+            } else if is_between_wrapped(
+                self.recv.seq_num.wrapping_sub(1),
+                incoming_seq_num,
+                window_end,
+            ) || is_between_wrapped(
+                self.recv.seq_num.wrapping_sub(1),
+                incoming_seq_num.wrapping_add(data_len - 1),
+                window_end,
+            ) {
+                println!("7");
                 true
             } else {
+                println!("8");
                 false
             }
         };
-
+        
+        // println!("Connection.handle_packet => acceptable_incoming_seq_num: {}", acceptable_incoming_seq_num);
+        println!("Connection.handle_packet => self.send: {:?}", self.send);
+        println!("Connection.handle_packet => self.recv: {:?}", self.recv);
         if !acceptable_incoming_seq_num {
             self.write(dev, self.send.seq_num, 0)?;
             return Ok(self.available_io());
         }
-
+        println!("fixed!!!");
         if !tcp_req_header.ack() {
             if tcp_req_header.syn() {
                 self.recv.seq_num = incoming_seq_num.wrapping_add(1);
@@ -328,25 +364,37 @@ impl Connection {
             // Takes into account integer wrapping.
             // self.send.seq_num.wrapping_add(1) makes seq_num inclusive in comparison.
             // Makes is_between_wrapped more generic.
-            if is_between_wrapped(self.send.unacked_seq_num, incoming_ack_num, self.send.seq_num.wrapping_add(1)) {
+            if is_between_wrapped(
+                self.send.unacked_seq_num,
+                incoming_ack_num,
+                self.send.seq_num.wrapping_add(1),
+            ) {
                 if !self.data_out.is_empty() {
                     let data_start = if self.send.unacked_seq_num == self.send.init_seq_num {
-                        // snd.una hasn't been updated yet with ACK for our SYN, so data starts just beyond it
+                        // send.unacked_seq_num hasn't been updated yet with ACK for our SYN,
+                        // so data starts just beyond it
                         self.send.unacked_seq_num.wrapping_add(1)
                     } else {
                         self.send.unacked_seq_num
                     };
-                    let acked_data_end =
-                        min(incoming_ack_num.wrapping_sub(data_start) as usize, self.data_out.len());
+                    let acked_data_len = min(
+                        incoming_ack_num.wrapping_sub(data_start) as usize,
+                        self.data_out.len(),
+                    );
 
-                    self.data_out.drain(..acked_data_end);
+                    self.data_out.drain(..acked_data_len);
 
-                    self.timers.send_times.retain(|seq, sent| {
-                        if is_between_wrapped(self.send.unacked_seq_num, *seq, incoming_ack_num) {
-                            let round_trip_time = sent.elapsed();
+                    self.timers.send_times.retain(|seq_num, sent_at| {
+                        if is_between_wrapped(
+                            self.send.unacked_seq_num,
+                            *seq_num,
+                            incoming_ack_num
+                        ) {
+                            let round_trip_time = sent_at.elapsed();
                             // SRTT = (ALPHA * SRTT) + ((1-ALPHA) * RTT)
                             self.timers.smoothed_round_trip_time =
-                                self.timers.smoothed_round_trip_time.mul_f64(0.8) + round_trip_time.mul_f64(1.0 - 0.8);
+                                self.timers.smoothed_round_trip_time.mul_f64(0.8)
+                                    + round_trip_time.mul_f64(1.0 - 0.8);
                             return false;
                         }
                         true
@@ -359,7 +407,7 @@ impl Connection {
         if let State::FinWait1 = self.state {
             if let Some(closed_at) = self.closed_at {
                 if self.send.unacked_seq_num == closed_at.wrapping_add(1) {
-                    // our FIN has been ACKed
+                    // our FIN has been acked
                     self.state = State::FinWait2;
                 }
             }
@@ -370,7 +418,7 @@ impl Connection {
                 let mut unread_data_idx = self.recv.seq_num.wrapping_sub(incoming_seq_num) as usize;
                 if unread_data_idx > data_len as usize {
                     // We must have received a retransmitted FIN we have already seen.
-                    // rcv.nxt points beyond FIN, but fin is not in data.
+                    // recv.seq_num points beyond FIN, but FIN is not in the data.
                     unread_data_idx = 0;
                 }
                 self.data_in.extend(&data[unread_data_idx..]);
@@ -404,14 +452,18 @@ impl Connection {
 
     pub fn tick<'a>(&mut self, dev: &mut Device) -> Result<()> {
         if let State::FinWait2 | State::TimeWait = self.state {
-            // we have shutdown our write side and the other side acked, no need to (re)transmit anything
+            // we have shut down our write side and the other side acked,
+            // no need to (re)transmit anything
             return Ok(());
         }
-        let n_unacked = self
+
+        // println!("Connection.tick => ");
+        // length of data which has been sent but not acked yet
+        let unacked_len = self
             .closed_at
             .unwrap_or(self.send.seq_num)
             .wrapping_sub(self.send.unacked_seq_num);
-        let n_unsent = self.data_out.len() - n_unacked as usize;
+        let unsent_len = self.data_out.len() - unacked_len as usize;
 
         // RFC: 793, section: 3.7
         // the oldest unacked seq
@@ -423,34 +475,49 @@ impl Connection {
             .map(|val| val.1.elapsed());
 
         let should_retransmit = if let Some(elapsed) = elapsed {
-            elapsed > Duration::from_secs(1) && elapsed > self.timers.smoothed_round_trip_time.mul_f32(1.5)
+            elapsed > Duration::from_secs(1)
+                && elapsed > self.timers.smoothed_round_trip_time.mul_f32(1.5)
         } else {
             false
         };
 
         if should_retransmit {
-            let n_resend = min(self.data_out.len(), self.send.window as usize);
-            if n_resend < self.send.window as usize && self.is_closed {
+            let resend_len = min(self.data_out.len(), self.send.window as usize);
+            if resend_len < self.send.window as usize && self.is_closed {
                 self.tcp_resp_header.fin = true;
-                self.closed_at = Some(self.send.unacked_seq_num.wrapping_add(self.data_out.len() as u32));
+                self.closed_at = Some(
+                    self.send
+                        .unacked_seq_num
+                        .wrapping_add(self.data_out.len() as u32),
+                );
             }
-            self.write(dev, self.send.unacked_seq_num, n_resend)?;
+            self.write(dev, self.send.unacked_seq_num, resend_len)?;
         } else {
             // send new data
-            if n_unsent == 0 && self.closed_at.is_some() {
+
+            if unsent_len == 0 && self.closed_at.is_some() {
                 return Ok(());
-            }
-            let n_allowed = self.send.window as u32 - n_unacked;
-            if n_allowed == 0 {
-                return Ok(());
-            }
-            let n_send = min(n_unsent as u32, n_allowed);
-            if n_send < n_allowed && self.is_closed && self.closed_at.is_none() {
-                self.tcp_resp_header.fin = true;
-                self.closed_at = Some(self.send.unacked_seq_num.wrapping_add(self.data_out.len() as u32));
             }
 
-            self.write(dev, self.send.seq_num, n_send as usize)?;
+            // Amount of new data we are allowed to send,
+            // which shouldn't exceed window size.
+            // Takes into account data already sent but still unacked.
+            let allowed_len = self.send.window as u32 - unacked_len;
+            if allowed_len == 0 {
+                return Ok(());
+            }
+
+            let send_len = min(unsent_len as u32, allowed_len);
+            if send_len < allowed_len && self.is_closed && self.closed_at.is_none() {
+                self.tcp_resp_header.fin = true;
+                self.closed_at = Some(
+                    self.send
+                        .unacked_seq_num
+                        .wrapping_add(self.data_out.len() as u32),
+                );
+            }
+
+            self.write(dev, self.send.seq_num, send_len as usize)?;
         }
         // If no SENDs have been issued and there is no pending data to send,
         // then form a FIN segment and send it, and enter FIN-WAIT-1 state;
@@ -458,6 +525,7 @@ impl Connection {
         Ok(())
     }
 
+    #[allow(dead_code)]
     fn reset_connection(&mut self, dev: &mut Device) -> Result<()> {
         // If the incoming segment has an ACK field, the reset takes its
         // sequence number from the ACK field of the segment, otherwise the
@@ -507,29 +575,29 @@ impl Connection {
     }
 }
 
-fn is_between_wrapped(start: u32, between: u32, end: u32) -> bool {
-    if start == between {
-        return false;
-    }
-    // if start < between then end shouldn't be between them:
-    // 0...start...between...end...u32::MAX -> OK
-    // 0...end...start...between...u32::MAX -> OK
-    // 0...start...end...between...u32::MAX -> not OK
-    if start < between {
-        if start <= end && end <= between {
-            return false;
-        }
-        // if between < start then end should be between them:
-        // 0...between...end...start...u32::MAX -> OK
-        // 0...end...between...start...u32::MAX -> not OK
-        // 0...between...start...end...u32::MAX -> not OK
-    } else {
-        if !(between < end && end < start) {
-            return false;
-        }
-    }
-    true
-}
+// fn is_between_wrapped(start: u32, between: u32, end: u32) -> bool {
+//     if start == between {
+//         return false;
+//     }
+//     // if start < between then end shouldn't be between them:
+//     // 0...start...between...end...u32::MAX -> OK
+//     // 0...end...start...between...u32::MAX -> OK
+//     // 0...start...end...between...u32::MAX -> not OK
+//     if start < between {
+//         if start <= end && end <= between {
+//             return false;
+//         }
+//         // if between < start then end should be between them:
+//         // 0...between...end...start...u32::MAX -> OK
+//         // 0...end...between...start...u32::MAX -> not OK
+//         // 0...between...start...end...u32::MAX -> not OK
+//     } else {
+//         if !(between < end && end < start) {
+//             return false;
+//         }
+//     }
+//     true
+// }
 
 fn wrapping_less_than(lhs: u32, rhs: u32) -> bool {
     // From RFC1323:
@@ -539,9 +607,14 @@ fn wrapping_less_than(lhs: u32, rhs: u32) -> bool {
     // ensure that new data is never mistakenly considered old and vice-
     // versa, the left edge of the sender's window has to be at most
     // 2**31 away from the right edge of the receiver's window.
+    //
+    // u32 max value = 4,294,967,295
+    // 1 << 31 = 2,147,483,648
+    // 50 - 60 = 4,294,967,286 > 2,147,483,648
+    // 4,294,967,000 - 150 = 4,294,966,850 > 2,147,483,648
     lhs.wrapping_sub(rhs) > (1 << 31)
 }
 
-// fn is_between_wrapped(start: u32, between: u32, end: u32) -> bool {
-//     wrapping_less_than(start, between) && wrapping_less_than(between, end)
-// }
+fn is_between_wrapped(start: u32, between: u32, end: u32) -> bool {
+    wrapping_less_than(start, between) && wrapping_less_than(between, end)
+}
